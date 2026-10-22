@@ -24,7 +24,7 @@ import {
   SUBTITLE_DEFAULTS,
   type BilingualFormat,
 } from "./formats/subtitle";
-import { MARKDOWN_DEFAULTS, filterMarkdownLines, restorePlaceholders, splitMarkdownSegments, mergeMarkdownSegments, applyRemoveCharsToMarkdown, applyRemoveCharsToSegments, PLACEHOLDER_REPLACE_REGEX, splitPlaceholderParts } from "./formats/markdown";
+import { MARKDOWN_DEFAULTS, filterMarkdownLines, restorePlaceholders, splitMarkdownSegments, mergeMarkdownSegments, applyRemoveCharsToMarkdown, applyRemoveCharsToSegments, PLACEHOLDER_REPLACE_REGEX, splitPlaceholderParts, type PlaceholderMaps } from "./formats/markdown";
 import { softFilledIndices, transformSkippingSoftFilled, mapSkippingSoftFilled, collectEmptiedSlots } from "./softFill";
 
 /** CLI 驱动提供给 handler 的能力(翻译、清理、命令行开关)。 */
@@ -187,6 +187,104 @@ const placeholderSignature = (text: string): string => (text.match(PLACEHOLDER_R
 /** 表格行的竖线数量；单元格内的竖线也要算，列数一变就是结构被写坏。 */
 const pipeCount = (text: string): number => (text.match(/\|/g) ?? []).length;
 
+/**
+ * 内联模式的译文收口：压回单行，并收紧占位符两侧的空白。模型常在
+ * `<<<LINK_PRE_1>>>` 前后补空格，还原后会变成 `[ 文本 ](url)` 或多缩进的
+ * 列表项。整行与 sentinel 重试两条路径共用，避免只修一边。
+ */
+const tidyInline = (text: string): string =>
+  text
+    .replace(/\r?\n+/g, " ")
+    .replace(/\s+(?=<<<LINK_SUF_\d+>>>)/g, "")
+    .replace(/(<<<LINK_PRE_\d+>>>)\s+/g, "$1")
+    .replace(/(<<<(?:LIST|HEADING)_\d+>>>)\s+/g, "$1")
+    .trim();
+
+/** 句末标点，可后跟右括号/引号；用于把一行切成重试段。 */
+const SENTENCE_END = /[.。;；!?][)"'”’\]]?$/;
+
+/**
+ * raw-math 重试的请求体：把 LaTeX / HTML / 列表 / 标题占位符换回原文，让模型
+ * 直接面对 `$...$` 与 `<sup>`。段级模型对真实数学符号的保真度远高于抽象 token，
+ * 十几处公式的稠密行尤其明显。链接与行内代码仍用 ⟦k⟧ 保护（模型会翻译 URL）。
+ */
+const buildRawMathWire = (line: string, maps: PlaceholderMaps): { wire: string; sentinels: string[] } => {
+  let wire = line;
+  // 只还原数学与 HTML。标题/列表/引用前缀必须继续用 ⟦k⟧ 保护——模型会顺手
+  // 丢掉裸 `# ` 或 `- `，整行结构就没了。
+  for (const map of [maps.latexInlinePlaceholders, maps.latexBlockPlaceholders, maps.htmlPlaceholders]) {
+    for (const [placeholder, original] of Object.entries(map)) {
+      wire = wire.split(placeholder).join(original);
+    }
+  }
+  const sentinels: string[] = [];
+  wire = wire.replace(/<<<[A-Z_]+_\d+>>>/g, (token) => {
+    sentinels.push(token);
+    return `⟦${sentinels.length}⟧`;
+  });
+  return { wire, sentinels };
+};
+
+/** raw-math 译文验收：$ 必须配平、不能漏出字面 token、剩余 sentinel 必须齐全。 */
+const rawMathOk = (text: string, sentinels: string[]): boolean => {
+  if (/<<<|>>>/.test(text)) return false;
+  if ((text.match(/\$/g) ?? []).length % 2 !== 0) return false;
+  const want = sentinels.map((_token, k) => `⟦${k + 1}⟧`).sort().join("");
+  const got = (text.match(/⟦\d+⟧/g) ?? []).sort().join("");
+  return want === got;
+};
+
+type PlaceholderPart = { value: string; isPlaceholder: boolean };
+
+/**
+ * 把一行按句子边界聚合成若干重试段，每段不超过 maxPh 个占位符，段内再把
+ * 占位符换成 ⟦k⟧。只在句子边界切：切在句子中间会造出 "was produced from"
+ * 这类无宾语的孤片段，模型看不到被占位的内容，只能用 "..." 标记缺口。
+ * 单句本身超过 maxPh 时保持整句——拆开句子同样会留孤片段。
+ */
+const chunkBySentence = (parts: PlaceholderPart[], maxPh = 8): Array<{ wire: string; map: string[] }> => {
+  const sentences: PlaceholderPart[][] = [];
+  let cur: PlaceholderPart[] = [];
+  for (const part of parts) {
+    cur.push(part);
+    if (!part.isPlaceholder && SENTENCE_END.test(part.value.trim())) {
+      sentences.push(cur);
+      cur = [];
+    }
+  }
+  if (cur.length) sentences.push(cur);
+
+  const flush = (buf: PlaceholderPart[]) => {
+    const map: string[] = [];
+    let wire = "";
+    for (const part of buf) {
+      if (part.isPlaceholder) {
+        map.push(part.value);
+        wire += `⟦${map.length}⟧`;
+      } else {
+        wire += part.value;
+      }
+    }
+    return { wire, map };
+  };
+
+  const chunks: Array<{ wire: string; map: string[] }> = [];
+  let buf: PlaceholderPart[] = [];
+  let ph = 0;
+  for (const sentence of sentences) {
+    const n = sentence.filter((p) => p.isPlaceholder).length;
+    if (ph + n > maxPh && buf.length > 0) {
+      chunks.push(flush(buf));
+      buf = [];
+      ph = 0;
+    }
+    buf.push(...sentence);
+    ph += n;
+  }
+  if (buf.length > 0) chunks.push(flush(buf));
+  return chunks;
+};
+
 const markdownHandler: CliFormatHandler = {
   id: "markdown",
   extensions: [".md", ".markdown", ".mdx"],
@@ -257,15 +355,8 @@ const markdownHandler: CliFormatHandler = {
       cleaned.forEach((text, index) => {
         const source = textsToTranslate[index];
         // 内联模式一个单元就是一行：模型偶尔会回多行（列表 `- [x] x` 被拆成
-        // "- \n[x] x"），压回单行，避免把 Markdown 结构写坏。占位符两侧的
-        // 空白也一并收紧：模型常在 `<<<LINK_PRE_1>>>` 前后补空格，还原后
-        // 变成 `[ 文本 ](url)` 或多缩进的列表项。
-        const singleLine = text
-          .replace(/\r?\n+/g, " ")
-          .replace(/\s+(?=<<<LINK_SUF_\d+>>>)/g, "")
-          .replace(/(<<<LINK_PRE_\d+>>>)\s+/g, "$1")
-          .replace(/(<<<(?:LIST|HEADING)_\d+>>>)\s+/g, "$1")
-          .trim();
+        // "- \n[x] x"），tidyInline 负责压回单行并收紧占位符两侧空白。
+        const singleLine = tidyInline(text);
         // 字面 <<< / >>> 也是坏信号：模型会把 token 写成 <<<>>> 或
         // <<<LATEXInline_100>>>，签名匹配不到它们，还原时就会漏进正文。
         // 表格行额外守住列数：模型会把 <sup> 挪出单元格、多出竖线，宁可整行
@@ -286,49 +377,84 @@ const markdownHandler: CliFormatHandler = {
       cleaned = normalized;
 
       if (fallbackIndices.length > 0) {
-        // 整行失败（长段落 token 多，模型很容易写错一个）时退回片段级重译：
-        // 占位符留在本地，只把散文片段送模型，结构与公式都不会丢。
-        const fragmentTexts: string[] = [];
-        type FragmentPlan = Array<{ placeholder: string } | { index: number; leading: string; trailing: string }>;
-        const plans = new Map<number, FragmentPlan>();
+        // 整行失败（token 多，模型很容易写错一个）时的两级重试。
+        //
+        // 一级：raw-math。把 LaTeX / HTML 占位符换回真实 `$...$` 与 `<sup>` 再
+        // 送模型。段级模型对真实数学符号的保真度远高于抽象 token——稠密行有
+        // 十几处公式时尤其明显。验收要求 `$` 配平，避免写出坏公式。
+        //
+        // 二级：sentinel + 句子分段。把剩余占位符换成 ⟦k⟧，按句末标点切成每段
+        // ≤8 个占位符再重试。不要按占位符切成散文片段——那样会留下
+        // "was produced from" 这类无宾语的孤片段，模型看不到被占位的内容，
+        // 只能用 "..." 标记缺口，产物就成了「由...产生」，属静默丢词。
+        const rawWires: string[] = [];
+        const rawPlans = new Map<number, string[]>();
         for (const index of fallbackIndices) {
-          const plan: FragmentPlan = [];
-          for (const part of splitPlaceholderParts(textsToTranslate[index])) {
-            if (part.isPlaceholder) {
-              plan.push({ placeholder: part.value });
-              continue;
-            }
-            const leading = part.value.match(/^\s*/)?.[0] ?? "";
-            const trailing = part.value.match(/\s*$/)?.[0] ?? "";
-            const core = part.value.trim();
-            if (!core) {
-              plan.push({ index: -1, leading: part.value, trailing: "" });
-              continue;
-            }
-            plan.push({ index: fragmentTexts.length, leading, trailing });
-            fragmentTexts.push(core);
-          }
-          plans.set(index, plan);
+          const built = buildRawMathWire(textsToTranslate[index], parsed);
+          rawWires.push(built.wire);
+          rawPlans.set(index, built.sentinels);
         }
-        if (fragmentTexts.length > 0) {
-          const fallbackOutcome = await ctx.translate(fragmentTexts, undefined, { fileName: ctx.fileName });
-          const translated = applyRemoveCharsToSegments(fallbackOutcome.lines, softFilledIndices(fallbackOutcome), ctx.removeChars).map((text, index) => {
-            // 片段级同样要收口：模型可能把提示词里的占位符示例 `<<<…>>>`
-            // 抄进译文，或回多行。命中字面 token 就退回该片段原文。
-            const singleLine = text.replace(/\r?\n+/g, " ").trim();
-            return /<<<|>>>/.test(singleLine) ? fragmentTexts[index] : singleLine;
-          });
-          for (const [index, plan] of plans) {
+        const rawOutcome = await ctx.translate(rawWires, undefined, { fileName: ctx.fileName });
+        const rawTranslated = applyRemoveCharsToSegments(rawOutcome.lines, softFilledIndices(rawOutcome), ctx.removeChars);
+        const unresolved: number[] = [];
+        fallbackIndices.forEach((index, i) => {
+          const source = textsToTranslate[index];
+          const sentinels = rawPlans.get(index) ?? [];
+          const raw = (rawTranslated[i] ?? "").replace(/\r?\n+/g, " ").trim();
+          if (!rawMathOk(raw, sentinels)) {
+            unresolved.push(index);
+            return;
+          }
+          const restored = raw.replace(/⟦(\d+)⟧/g, (_m, d: string) => sentinels[Number(d) - 1] ?? "");
+          cleaned[index] = source.startsWith("|") && pipeCount(restored) !== pipeCount(source) ? source : tidyInline(restored);
+        });
+
+        if (unresolved.length > 0) {
+          const wires: string[] = [];
+          const plans = new Map<number, Array<{ wire: string; map: string[] }>>();
+          for (const index of unresolved) {
+            const chunks = chunkBySentence(splitPlaceholderParts(textsToTranslate[index]));
+            plans.set(index, chunks);
+            for (const chunk of chunks) wires.push(chunk.wire);
+          }
+          const retryOutcome = await ctx.translate(wires, undefined, { fileName: ctx.fileName });
+          const retried = applyRemoveCharsToSegments(retryOutcome.lines, softFilledIndices(retryOutcome), ctx.removeChars);
+          let slot = 0;
+          for (const index of unresolved) {
             const source = textsToTranslate[index];
-            const rebuilt = plan
-              .map((frag) => ("placeholder" in frag ? frag.placeholder : frag.index >= 0 ? frag.leading + (translated[frag.index] ?? "") + frag.trailing : frag.leading))
-              .join("");
-            // 片段拼回来后列数仍可能变（模型会把竖线挪进相邻单元格），表格行
-            // 一旦错列就退回原文。
+            const chunks = plans.get(index) ?? [];
+            const pieces: string[] = [];
+            let ok = true;
+            for (const chunk of chunks) {
+              const raw = (retried[slot] ?? "").replace(/\r?\n+/g, " ").trim();
+              slot += 1;
+              // sentinel 集合必须与发送时完全一致（编号、数量），否则映射不可靠；
+              // 模型把 token 抄回字面 <<< 也一样判失败。
+              const want = chunk.map.map((_token, k) => `⟦${k + 1}⟧`).sort().join("");
+              const got = (raw.match(/⟦\d+⟧/g) ?? []).sort().join("");
+              if (want !== got || /<<<|>>>/.test(raw)) {
+                ok = false;
+                continue;
+              }
+              pieces.push(tidyInline(raw.replace(/⟦(\d+)⟧/g, (_m, d: string) => chunk.map[Number(d) - 1] ?? "")));
+            }
+            if (!ok) {
+              cleaned[index] = source;
+              continue;
+            }
+            const rebuilt = pieces.join("");
+            // 重试后列数仍可能变（模型会把竖线挪进相邻单元格），表格行错列就退回原文。
             cleaned[index] = source.startsWith("|") && pipeCount(rebuilt) !== pipeCount(source) ? source : rebuilt;
           }
         }
       }
+    }
+    // 最后一道：`$` 落单的行退回原文。模型偶尔会吞掉配对的 `$`（源文 OCR
+    // 残留的 `$5 ,$` 这类尤其容易），落单的 `$` 会把该行后半段全部渲染成公式。
+    if (inlinePlaceholders) {
+      cleaned.forEach((text, index) => {
+        if ((text.match(/\$/g) ?? []).length % 2 === 1) cleaned[index] = textsToTranslate[index];
+      });
     }
     const merged = mergeMarkdownSegments(lineSegments, cleaned);
 
