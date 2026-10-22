@@ -13,6 +13,13 @@ export interface MarkdownOptions {
   translateLatex: boolean;
   /** 是否翻译链接文本 */
   translateLinkText: boolean;
+  /**
+   * 占位符内联模式：整行（含 <<<…>>> 占位符）作为一个翻译单元发送，而不是按
+   * 占位符切成多个片段。片段级模型（Hunyuan-MT 这类段级 MT）拿到孤立的
+   * "See" / "the docs" 会补解释；整行发送能保留上下文，占位符在还原阶段再
+   * 替换回原文。默认关闭，保持既有行为。
+   */
+  inlinePlaceholders?: boolean;
 }
 
 /**
@@ -29,6 +36,7 @@ export const MARKDOWN_DEFAULTS: { contextAware: boolean; options: MarkdownOption
     translateMultilineCode: false,
     translateLatex: false,
     translateLinkText: true,
+    inlinePlaceholders: false,
   },
 };
 
@@ -47,6 +55,13 @@ const PLACEHOLDER_SPLIT_REGEX = new RegExp(`(<<<(?:${placeholderPattern})>>>)`);
 const PLACEHOLDER_TEST_REGEX = new RegExp(`^<<<(?:${placeholderPattern})>>>$`);
 /** 全局替换占位符 */
 export const PLACEHOLDER_REPLACE_REGEX = new RegExp(`<<<(?:${placeholderPattern})>>>`, "g");
+
+/**
+ * 按占位符切分一行，并保留分隔符（`isPlaceholder` 标记）。内联模式的兜底
+ * 重译要用它：整行 token 被模型写坏时，只把散文片段送翻，占位符留在本地。
+ */
+export const splitPlaceholderParts = (text: string): Array<{ value: string; isPlaceholder: boolean }> =>
+  text.split(PLACEHOLDER_SPLIT_REGEX).map((value) => ({ value, isPlaceholder: PLACEHOLDER_TEST_REGEX.test(value) }));
 /**
  * 跨占位符配对守卫:HTML 注释 / LaTeX 块的内容类逐字符回火,禁止跨越先行
  * pass 产出的占位符 token(围栏占位符行【不含】反引号也不含空行,裸内容类
@@ -384,7 +399,7 @@ export const filterMarkdownLines = (lines: string[], mdOptions: MarkdownOptions)
     // 图片 - 始终翻译 alt 文本。URL 段允许一层嵌套括号(维基百科式
     // /wiki/A_(b) 链接),旧的懒惰 .*? 会在 URL 内第一个 ")" 截断,把链接
     // 剩余部分当可翻译文本送出去,链接结构被写坏。
-    modifiedLine = modifiedLine.replace(/(!\[)(.*?)(\]\((?:[^()\n]|\([^()\n]*\))*\))/g, (match, prefix, content, suffix) => {
+    modifiedLine = modifiedLine.replace(/(!\[)([^\[\]\n]*)(\]\((?:[^()\n]|\([^()\n]*\))*\))/g, (match, prefix, content, suffix) => {
       // 如果 alt 为空，整个替换为占位符
       if (!content.trim()) {
         return store(linkPlaceholders, "LINK", "link", match);
@@ -399,8 +414,11 @@ export const filterMarkdownLines = (lines: string[], mdOptions: MarkdownOptions)
       return `${prefixPlaceholder}${content}${suffixPlaceholder}`;
     });
 
-    // 链接（非图片）- 根据选项决定是否翻译链接文本(URL 嵌套括号同上)
-    modifiedLine = modifiedLine.replace(/(\[)(.*?)(\]\((?:[^()\n]|\([^()\n]*\))*\))/g, (match, prefix, content, suffix) => {
+    // 链接（非图片）- 根据选项决定是否翻译链接文本(URL 嵌套括号同上)。
+    // 链接文本不允许含 [ 或 ]：`. *?` 会从 GFM 任务列表的 `[ ]` 开始匹配，
+    // 把 `- [ ] keep [links](url)` 整体当成一个链接（正文变成
+    // " ] keep [links"），复选框和链接标签一起被写坏。
+    modifiedLine = modifiedLine.replace(/(\[)([^\[\]\n]*)(\]\((?:[^()\n]|\([^()\n]*\))*\))/g, (match, prefix, content, suffix) => {
       if (mdOptions.translateLinkText) {
         const prefixPlaceholder = `<<<LINK_PRE_${counters.link}>>>`;
         const suffixPlaceholder = `<<<LINK_SUF_${counters.link}>>>`;
@@ -553,12 +571,33 @@ export const applyRemoveCharsToSegments = (translatedTexts: string[], softFilled
  *
  * 组件与 CLI 共用,避免两处各写一份切分/回填(错位只会在其中一处显形)。
  */
-export const splitMarkdownSegments = (contentLines: string[], sourceLineNumbers: number[]): { textsToTranslate: string[]; textLineNumbers: number[]; lineSegments: MarkdownLineSegments[] } => {
+export const splitMarkdownSegments = (contentLines: string[], sourceLineNumbers: number[], inlinePlaceholders = false): { textsToTranslate: string[]; textLineNumbers: number[]; lineSegments: MarkdownLineSegments[] } => {
   const textsToTranslate: string[] = [];
   const textLineNumbers: number[] = [];
   const lineSegments: MarkdownLineSegments[] = [];
 
   contentLines.forEach((line, lineIdx) => {
+    if (inlinePlaceholders) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) {
+        lineSegments.push({ mapping: [{ type: "empty", value: line }] });
+        return;
+      }
+      // 纯占位符行（折叠的代码块 / frontmatter / LaTeX 块）没有散文可译，
+      // 送去模型只会被改写或吞掉 token。
+      const hasProse = trimmedLine.split(PLACEHOLDER_SPLIT_REGEX).some((part) => part.trim() !== "" && !PLACEHOLDER_TEST_REGEX.test(part));
+      if (!hasProse) {
+        lineSegments.push({ mapping: [{ type: "placeholder", value: line }] });
+        return;
+      }
+      const leadingSpace = line.match(/^\s*/)?.[0] || "";
+      const trailingSpace = line.match(/\s*$/)?.[0] || "";
+      lineSegments.push({ mapping: [{ type: "text", index: textsToTranslate.length, leading: leadingSpace, trailing: trailingSpace }] });
+      textLineNumbers.push(sourceLineNumbers[lineIdx]);
+      textsToTranslate.push(trimmedLine);
+      return;
+    }
+
     const segments = line.split(PLACEHOLDER_SPLIT_REGEX);
     const mapping: MarkdownLineSegments["mapping"] = [];
     for (const segment of segments) {

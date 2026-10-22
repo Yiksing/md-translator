@@ -78,6 +78,9 @@ Markdown files:
       --md-translate-frontmatter / --md-translate-code / --md-translate-latex
                             Translate those parts (default: protected).
       --md-no-link-text     Keep [link text](url) labels untranslated (default: translated).
+      --md-inline           Send each line whole, with its <<<…>>> placeholders inline,
+                            instead of splitting it into fragments. Better for
+                            segment-level local MT models (Hunyuan-MT etc.).
 `;
 
 const parseCliArgs = () =>
@@ -104,6 +107,7 @@ const parseCliArgs = () =>
       "md-translate-code": { type: "boolean" },
       "md-translate-latex": { type: "boolean" },
       "md-no-link-text": { type: "boolean" },
+      "md-inline": { type: "boolean" },
       "api-key": { type: "string" },
       url: { type: "string" },
       model: { type: "string" },

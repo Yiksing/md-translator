@@ -148,6 +148,7 @@ Output lands beside the input (or in `-o <dir>`) as `guide.zh.md`.
 | `--md-raw` | Translate raw lines instead of protecting code / links / LaTeX. |
 | `--md-translate-frontmatter` · `--md-translate-code` · `--md-translate-latex` | Translate those parts (protected by default). |
 | `--md-no-link-text` | Keep `[link text](url)` labels untranslated (translated by default). |
+| `--md-inline` | Send each line whole, with its `<<<…>>>` placeholders inline, instead of splitting it into fragments. Better for segment-level local MT models. |
 | `--context` · `--no-context` | Context-aware LLM batching. Off by default for Markdown; `--context` implies `--md-raw`. |
 | `--no-cache` · `--cache-file <file>` | Cache control. Default `~/.translate-cli-cache.json`. |
 | `--relay` · `--no-relay` | Route through the API relay. Off by default — Node has no CORS to work around. |

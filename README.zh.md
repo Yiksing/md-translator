@@ -148,6 +148,7 @@ yarn cli -i post.md -t de -m deepseek --md-translate-frontmatter --md-no-link-te
 | `--md-raw` | 按原始行翻译，不保护代码 / 链接 / LaTeX |
 | `--md-translate-frontmatter` · `--md-translate-code` · `--md-translate-latex` | 连这些部分也翻译（默认保护） |
 | `--md-no-link-text` | 保留 `[链接文字](url)` 不译（默认翻译） |
+| `--md-inline` | 整行连同 `<<<…>>>` 占位符一起发送，不切成片段；适合段级本地 MT 模型 |
 | `--context` · `--no-context` | 上下文关联批处理。Markdown 默认关闭；`--context` 会连带打开 `--md-raw` |
 | `--no-cache` · `--cache-file <file>` | 缓存控制，默认 `~/.translate-cli-cache.json` |
 | `--relay` · `--no-relay` | 是否走 API 中转。默认关闭——Node 端没有 CORS 需要绕 |

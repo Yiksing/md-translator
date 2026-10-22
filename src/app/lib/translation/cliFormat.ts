@@ -24,7 +24,7 @@ import {
   SUBTITLE_DEFAULTS,
   type BilingualFormat,
 } from "./formats/subtitle";
-import { MARKDOWN_DEFAULTS, filterMarkdownLines, restorePlaceholders, splitMarkdownSegments, mergeMarkdownSegments, applyRemoveCharsToMarkdown, applyRemoveCharsToSegments } from "./formats/markdown";
+import { MARKDOWN_DEFAULTS, filterMarkdownLines, restorePlaceholders, splitMarkdownSegments, mergeMarkdownSegments, applyRemoveCharsToMarkdown, applyRemoveCharsToSegments, PLACEHOLDER_REPLACE_REGEX, splitPlaceholderParts } from "./formats/markdown";
 import { softFilledIndices, transformSkippingSoftFilled, mapSkippingSoftFilled, collectEmptiedSlots } from "./softFill";
 
 /** CLI 驱动提供给 handler 的能力(翻译、清理、命令行开关)。 */
@@ -177,6 +177,16 @@ const subtitleHandler: CliFormatHandler = {
 
 // ─── markdown ────────────────────────────────────────────────────────────────
 
+/**
+ * 占位符指纹：用于内联模式下的完整性校验。模型只要少写、多写或改写一个
+ * <<<…>>> token，restorePlaceholders 就匹配不上，字面 token 会漏进产物。
+ * 按排序后的多重集合比较，允许模型调整 token 顺序，但不允许增删。
+ */
+const placeholderSignature = (text: string): string => (text.match(PLACEHOLDER_REPLACE_REGEX) ?? []).sort().join("\u0001");
+
+/** 表格行的竖线数量；单元格内的竖线也要算，列数一变就是结构被写坏。 */
+const pipeCount = (text: string): number => (text.match(/\|/g) ?? []).length;
+
 const markdownHandler: CliFormatHandler = {
   id: "markdown",
   extensions: [".md", ".markdown", ".mdx"],
@@ -224,7 +234,9 @@ const markdownHandler: CliFormatHandler = {
     // 结构化模式:每个内容行按占位符切开,只有散文片段进 wire。片段之间互相
     // 独立(不是连续文档),不走上下文批处理 —— 与网页端 translateBatch(...,
     // undefined) 同路径(chunk/逐行由方法的 chunkSize 决定,两边一致)。
-    const { textsToTranslate, textLineNumbers, lineSegments } = splitMarkdownSegments(contentLines, sourceLineNumbers);
+    // --md-inline:整行(含占位符)作为一个单元,给段级本地 MT 补上下文。
+    const inlinePlaceholders = ctx.flags["md-inline"] === true;
+    const { textsToTranslate, textLineNumbers, lineSegments } = splitMarkdownSegments(contentLines, sourceLineNumbers, inlinePlaceholders);
 
     // 没有可译片段(整篇都是代码块 / frontmatter)不是失败:网页端照样输出一份
     // 原样文档。返回 null 会让驱动记硬失败、整批 exit 1、这份文件不落盘 ——
@@ -238,7 +250,86 @@ const markdownHandler: CliFormatHandler = {
     // 与网页端 MDTranslator 共用同一份)。用占位符感知版,且必须在占位符还原
     // 【之前】:还原后再清理会损坏受保护的代码/链接/LaTeX 正文,而通用逐行
     // 清理命中 <<<…>>> 会毁掉 token 导致受保护块整块丢失 + 字面 token 泄漏。
-    const cleaned = applyRemoveCharsToSegments(outcome.lines, softFilledIndices(outcome), ctx.removeChars);
+    let cleaned = applyRemoveCharsToSegments(outcome.lines, softFilledIndices(outcome), ctx.removeChars);
+    if (inlinePlaceholders) {
+      const normalized: string[] = [];
+      const fallbackIndices: number[] = [];
+      cleaned.forEach((text, index) => {
+        const source = textsToTranslate[index];
+        // 内联模式一个单元就是一行：模型偶尔会回多行（列表 `- [x] x` 被拆成
+        // "- \n[x] x"），压回单行，避免把 Markdown 结构写坏。占位符两侧的
+        // 空白也一并收紧：模型常在 `<<<LINK_PRE_1>>>` 前后补空格，还原后
+        // 变成 `[ 文本 ](url)` 或多缩进的列表项。
+        const singleLine = text
+          .replace(/\r?\n+/g, " ")
+          .replace(/\s+(?=<<<LINK_SUF_\d+>>>)/g, "")
+          .replace(/(<<<LINK_PRE_\d+>>>)\s+/g, "$1")
+          .replace(/(<<<(?:LIST|HEADING)_\d+>>>)\s+/g, "$1")
+          .trim();
+        // 字面 <<< / >>> 也是坏信号：模型会把 token 写成 <<<>>> 或
+        // <<<LATEXInline_100>>>，签名匹配不到它们，还原时就会漏进正文。
+        // 表格行额外守住列数：模型会把 <sup> 挪出单元格、多出竖线，宁可整行
+        // 保留原文也不要产出错列的表。
+        const pipesOk = source === undefined || !source.startsWith("|") || pipeCount(singleLine) === pipeCount(source);
+        if (!pipesOk) {
+          normalized.push(source ?? singleLine);
+          return;
+        }
+        const valid = source !== undefined && !/<<<|>>>/.test(singleLine) && placeholderSignature(singleLine) === placeholderSignature(source);
+        if (valid) {
+          normalized.push(singleLine);
+        } else {
+          fallbackIndices.push(index);
+          normalized.push(source ?? singleLine);
+        }
+      });
+      cleaned = normalized;
+
+      if (fallbackIndices.length > 0) {
+        // 整行失败（长段落 token 多，模型很容易写错一个）时退回片段级重译：
+        // 占位符留在本地，只把散文片段送模型，结构与公式都不会丢。
+        const fragmentTexts: string[] = [];
+        type FragmentPlan = Array<{ placeholder: string } | { index: number; leading: string; trailing: string }>;
+        const plans = new Map<number, FragmentPlan>();
+        for (const index of fallbackIndices) {
+          const plan: FragmentPlan = [];
+          for (const part of splitPlaceholderParts(textsToTranslate[index])) {
+            if (part.isPlaceholder) {
+              plan.push({ placeholder: part.value });
+              continue;
+            }
+            const leading = part.value.match(/^\s*/)?.[0] ?? "";
+            const trailing = part.value.match(/\s*$/)?.[0] ?? "";
+            const core = part.value.trim();
+            if (!core) {
+              plan.push({ index: -1, leading: part.value, trailing: "" });
+              continue;
+            }
+            plan.push({ index: fragmentTexts.length, leading, trailing });
+            fragmentTexts.push(core);
+          }
+          plans.set(index, plan);
+        }
+        if (fragmentTexts.length > 0) {
+          const fallbackOutcome = await ctx.translate(fragmentTexts, undefined, { fileName: ctx.fileName });
+          const translated = applyRemoveCharsToSegments(fallbackOutcome.lines, softFilledIndices(fallbackOutcome), ctx.removeChars).map((text, index) => {
+            // 片段级同样要收口：模型可能把提示词里的占位符示例 `<<<…>>>`
+            // 抄进译文，或回多行。命中字面 token 就退回该片段原文。
+            const singleLine = text.replace(/\r?\n+/g, " ").trim();
+            return /<<<|>>>/.test(singleLine) ? fragmentTexts[index] : singleLine;
+          });
+          for (const [index, plan] of plans) {
+            const source = textsToTranslate[index];
+            const rebuilt = plan
+              .map((frag) => ("placeholder" in frag ? frag.placeholder : frag.index >= 0 ? frag.leading + (translated[frag.index] ?? "") + frag.trailing : frag.leading))
+              .join("");
+            // 片段拼回来后列数仍可能变（模型会把竖线挪进相邻单元格），表格行
+            // 一旦错列就退回原文。
+            cleaned[index] = source.startsWith("|") && pipeCount(rebuilt) !== pipeCount(source) ? source : rebuilt;
+          }
+        }
+      }
+    }
     const merged = mergeMarkdownSegments(lineSegments, cleaned);
 
     // ⚠ 输出【只 join contentLines】,不要像字幕那样把译文塞回原始 lines 数组:
